@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import ExitStack
+import json
 import os
 import time
 from pathlib import Path
@@ -167,13 +168,18 @@ class OpenAIImage(BaseTool):
         from openai import OpenAI
 
         start = time.time()
-        client = OpenAI(max_retries=0)
         model = inputs.get("model", "gpt-image-2")
         prompt = inputs["prompt"]
         size = inputs.get("size", "1024x1024")
         n = inputs.get("n", 1)
 
         try:
+            # Optional gateway headers, e.g. OPENAI_EXTRA_HEADERS='{"X-Model-Provider-Id": "azure_openai"}'
+            raw_headers = os.environ.get("OPENAI_EXTRA_HEADERS", "").strip()
+            extra_headers = json.loads(raw_headers) if raw_headers else None
+            if extra_headers is not None and not isinstance(extra_headers, dict):
+                raise ValueError("OPENAI_EXTRA_HEADERS must be a JSON object")
+            client = OpenAI(max_retries=0, default_headers=extra_headers)
             quality = inputs.get("quality", "high")
             output_format = inputs.get("output_format", "png")
             from jsonschema import validate
