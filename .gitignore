@@ -9,6 +9,7 @@ build/
 # Local model downloads (e.g. Piper TTS voices, fetched at runtime — not source)
 *.onnx
 *.onnx.json
+video-lib
 
 # Test/IDE
 .pytest_cache/
