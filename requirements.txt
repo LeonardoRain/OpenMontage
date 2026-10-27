@@ -16,3 +16,7 @@ uvicorn>=0.29
 watchfiles>=0.21
 
 websockets>=14.0       # Eleven v4 Turbo and realtime audio transports
+
+# Reference video analysis (video_analyzer / scene_detect). Without it,
+# scene_detect silently falls back to a coarser FFmpeg scene-score pass.
+scenedetect>=0.7       # pulls opencv-python, also used for motion classification

@@ -354,3 +354,30 @@ class TestStoryboardVisualSelection:
         assert card["visual"]["exists"] is True
         assert card["visual"]["path"].endswith("real.png")
         assert [t["path"].split("/")[-1] for t in card["takes"]] == ["real.png"]
+
+
+class TestSourceVideo:
+    """The shot player needs the reference footage, served from inside the project."""
+
+    def _project(self, root, metadata=None):
+        p = root / "src-proj"
+        _write(p / "project.json", {"project_id": "src-proj", "title": "t"})
+        _write(p / "artifacts" / "scene_plan.json",
+               {"version": "1.0", "metadata": metadata or {},
+                "scenes": [{"id": "sc01", "type": "broll", "description": "d",
+                            "start_seconds": 0, "end_seconds": 1}]})
+        return p
+
+    def test_finds_video_in_source_dir(self, projects_root):
+        p = self._project(projects_root)
+        (p / "source").mkdir()
+        (p / "source" / "ref.mp4").write_bytes(b"x")
+        s = load_board_state(p)
+        assert s["storyboard"]["source_video"] == "source/ref.mp4"
+
+    def test_declared_path_outside_project_is_ignored(self, projects_root, tmp_path):
+        outside = tmp_path / "elsewhere.mp4"
+        outside.write_bytes(b"x")
+        p = self._project(projects_root, {"source_media": str(outside)})
+        s = load_board_state(p)
+        assert s["storyboard"]["source_video"] is None

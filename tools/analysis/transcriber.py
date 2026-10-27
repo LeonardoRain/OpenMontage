@@ -63,6 +63,10 @@ class Transcriber(BaseTool):
             },
             "language": {"type": "string", "description": "ISO 639-1 language code, or null for auto-detect"},
             "diarize": {"type": "boolean", "default": False},
+            "initial_prompt": {
+                "type": "string",
+                "description": "Decoding prompt that biases vocabulary and script (e.g. simplified Chinese, character names)",
+            },
             "output_dir": {"type": "string", "description": "Directory for output files"},
         },
     }
@@ -87,7 +91,7 @@ class Transcriber(BaseTool):
 
     retry_policy = RetryPolicy(max_retries=1, retryable_errors=["MemoryError"])
     resume_support = ResumeSupport.FROM_START
-    idempotency_key_fields = ["input_path", "model_size", "language"]
+    idempotency_key_fields = ["input_path", "model_size", "language", "initial_prompt"]
     side_effects = ["writes transcript JSON to output_dir"]
     fallback = None
     user_visible_verification = [
@@ -118,6 +122,7 @@ class Transcriber(BaseTool):
         model_size = inputs.get("model_size", "base")
         language = inputs.get("language")
         diarize = inputs.get("diarize", False)
+        initial_prompt = inputs.get("initial_prompt") or None
         output_dir = Path(inputs.get("output_dir", input_path.parent))
 
         if not input_path.exists():
@@ -162,6 +167,7 @@ class Transcriber(BaseTool):
             segments_iter, transcription_info = model.transcribe(
                 str(input_path),
                 language=language,
+                initial_prompt=initial_prompt,
                 word_timestamps=True,
                 vad_filter=True,
             )

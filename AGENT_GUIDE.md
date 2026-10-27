@@ -471,7 +471,7 @@ Key capability families to look for in the output:
 - **music_generation** — Music and sound effect generation.
 - **video_post** — Composition, stitching, trimming (FFmpeg-based, always local).
 - **audio_processing** — Mixing, enhancement (FFmpeg-based, always local).
-- **analysis** — Transcription, scene detection, frame sampling.
+- **analysis** — Transcription, scene detection, cut refinement, frame sampling, and conversion of an analysis brief into Backlot storyboard artifacts (`video_analyzer` → `analysis_to_storyboard`).
 - **avatar** — Talking head and lip sync generation.
 - **character_animation** — Local character specs, SVG rigs, pose libraries, action timelines, previews, and QA.
 - **3d_world_generation** — Local semantic terrain, procedural biome scattering, explicit landmarks, diagnostic passes, and deterministic HyperFrames/Three.js camera fly-throughs. Route through `threejs_world` and read `skills/creative/3d-world-generation.md` plus `.agents/skills/threejs-world-generation/SKILL.md`.

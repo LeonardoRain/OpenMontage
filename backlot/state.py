@@ -231,6 +231,7 @@ def _build_stage_rail(
 ARTIFACT_FILES = {
     "research_brief": "research_brief.json",
     "brief": "brief.json",
+    "video_analysis_brief": "video_analysis_brief.json",
     "proposal_packet": "proposal_packet.json",
     "script": "script.json",
     "scene_plan": "scene_plan.json",
@@ -395,9 +396,50 @@ def _find_script_section(scene: dict, sections: list[dict]) -> Optional[dict]:
         if s0 is None or s1 is None:
             continue
         overlap = min(end, s1) - max(start, s0)
+        if overlap <= 0:
+            continue
+        # Require the section to actually live in this scene (or vice versa);
+        # a sliver of overlap from a neighbouring scene's line is not a match.
+        span = min(end - start, s1 - s0)
+        if span > 0 and overlap < 0.5 * span:
+            continue
         if overlap > best_overlap:
             best, best_overlap = s, overlap
     return best
+
+
+def _scene_details(scene: dict, sid: str, brief_scenes: dict[str, dict],
+                   plan_meta: Optional[dict] = None) -> dict:
+    """Everything the per-shot detail view shows beyond the card face.
+
+    The five-aspect breakdown (subject / subject_motion / scene /
+    spatial_framing / camera) is authored by the analyst and lives on the
+    video_analysis_brief; scene_plan carries the shot spec. Both are merged
+    here so the UI has one payload to render.
+    """
+    brief = brief_scenes.get(sid) or {}
+    # Analyses written at different times stored the breakdown in three
+    # shapes: brief scenes[].aspects, brief scenes[].five_aspects, and
+    # scene_plan.metadata.aspect_breakdown[<scene id>]. Accept all of them.
+    plan_breakdown = (plan_meta or {}).get("aspect_breakdown") or {}
+    aspects = (
+        brief.get("aspects") or brief.get("five_aspects")
+        or scene.get("aspects") or plan_breakdown.get(sid) or {}
+    )
+    if not isinstance(aspects, dict):
+        aspects = {}
+    return {
+        "aspects": aspects,
+        "shot_intent": scene.get("shot_intent") or brief.get("shot_intent"),
+        "narrative_role": scene.get("narrative_role"),
+        "information_role": scene.get("information_role"),
+        "framing": scene.get("framing"),
+        "movement": scene.get("movement"),
+        "overlay_notes": scene.get("overlay_notes"),
+        "shot_language": scene.get("shot_language") or brief.get("shot_language"),
+        "texture_keywords": scene.get("texture_keywords") or [],
+        "on_screen_text": brief.get("on_screen_text"),
+    }
 
 
 def _build_storyboard(
@@ -411,6 +453,19 @@ def _build_storyboard(
         return None
     sections = (artifacts.get("script") or {}).get("sections") or []
     manifest_assets = (artifacts.get("asset_manifest") or {}).get("assets") or []
+
+    # Reference analyses carry their five-aspect breakdown on the brief; index
+    # it by scene id and by index so both authoring styles resolve.
+    brief_scenes: dict[str, dict] = {}
+    brief = artifacts.get("video_analysis_brief") or {}
+    for i, bs in enumerate((brief.get("structure_analysis") or {}).get("scenes") or []):
+        if not isinstance(bs, dict):
+            continue
+        brief_scenes.setdefault(f"sc{i + 1:02d}", bs)
+        brief_scenes.setdefault(f"sc{i:02d}", bs)
+    for bs in (brief.get("structure_analysis") or {}).get("scenes") or []:
+        if isinstance(bs, dict) and bs.get("id"):
+            brief_scenes[str(bs["id"])] = bs
 
     def scene_key(value: Any) -> str:
         # 0 is a legitimate scene id — only None/absent collapses to "".
@@ -477,6 +532,8 @@ def _build_storyboard(
             "narration": (section or {}).get("text"),
             "section_label": (section or {}).get("label"),
             "required_assets": scene.get("required_assets") or [],
+            "overlay_notes": scene.get("overlay_notes"),
+            "details": _scene_details(scene, sid, brief_scenes, scene_plan.get("metadata")),
             "visual": active_visual,
             "takes": renderable,
             "audio": audio,
@@ -492,7 +549,34 @@ def _build_storyboard(
         "scenes": cards,
         "total_duration_seconds": total,
         "style_playbook": scene_plan.get("style_playbook"),
+        "source_video": _find_source_video(project_dir, scene_plan),
     }
+
+
+def _find_source_video(project_dir: Path, scene_plan: dict) -> Optional[str]:
+    """The reference footage a reverse-engineered plan was cut from.
+
+    Only files inside the project are returned — the /media route refuses
+    anything that escapes the project dir, so analysis runs link the source
+    into ``source/`` rather than pointing at an arbitrary path on disk.
+    """
+    root = project_dir.resolve()
+    declared = (scene_plan.get("metadata") or {}).get("source_media")
+    if declared:
+        for cand in (project_dir / declared, REPO_ROOT / declared):
+            try:
+                resolved = cand.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if resolved.is_file():
+                return _rel(project_dir, resolved)
+    src_dir = project_dir / "source"
+    if src_dir.is_dir():
+        for f in sorted(src_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in MEDIA_VIDEO_EXT:
+                return _rel(project_dir, f)
+    return None
 
 
 # ---------------------------------------------------------------------------

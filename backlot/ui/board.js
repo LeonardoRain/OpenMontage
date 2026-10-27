@@ -672,10 +672,285 @@ function sceneLabel(id) {
   return String(id).toUpperCase().slice(0, 10);
 }
 
+// ---------------------------------------------------------------------------
+// per-shot detail view
+// ---------------------------------------------------------------------------
+
+const ASPECT_ROWS = [
+  ["subject", "Subject"],
+  ["subject_motion", "Subject Motion"],
+  ["scene", "Scene"],
+  ["spatial_framing", "Spatial Framing"],
+  ["camera", "Camera"],
+];
+// Optional extras some analyses record alongside the five aspects.
+const ASPECT_EXTRA_ROWS = [
+  ["scene_overlays", "Overlays"],
+  ["light", "Lighting"],
+  ["transition", "Transition"],
+  ["beat", "Beat"],
+  ["source", "Footage source"],
+];
+
+function humanizeRole(value) {
+  if (!value) return "";
+  const zh = t(value);
+  // t() returns the key unchanged when no translation exists — humanise the
+  // raw identifier so English mode never shows "introduce_subject".
+  if (zh !== value) return zh;
+  return String(value).replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase());
+}
+
+// Shot-spec vocabulary is stored as raw enum values ("close_up",
+// "tungsten_warm"). Translate them in Chinese mode and keep the readable
+// English form otherwise.
+function techLabel(value) {
+  if (value == null || value === "") return "";
+  const raw = String(value);
+  const zh = t(raw);
+  if (zh !== raw) return zh;
+  return raw.replace(/^dof_/, "").replaceAll("_", " ");
+}
+
+function detailField(label, value) {
+  if (value == null || value === "" || value === "N/A") return null;
+  return el("div", { class: "sd-field" },
+    el("div", { class: "sd-label" }, t(label)),
+    el("div", { class: "sd-value" }, String(value)));
+}
+
+// ---------------------------------------------------------------------------
+// shot drawer: right-side panel with a segment player + dense breakdown.
+// Lives outside #app so a full board re-render (SSE refresh) never resets
+// playback or closes it.
+// ---------------------------------------------------------------------------
+
+let openSceneId = null;
+let drawerProject = null;
+const shotDrawer = el("div", { class: "shot-drawer", "aria-hidden": "true" });
+const shotBackdrop = el("div", { class: "shot-backdrop", onclick: () => closeSceneDetail() });
+document.body.append(shotBackdrop, shotDrawer);
+
+const seg = { start: 0, end: 0, raf: 0, armed: false };
+let segVideo = null;      // persistent <video>, reused across shots
+let segVideoSrc = null;
+
+function fmtTC(sec) {
+  const n = Math.max(0, Number(sec) || 0);
+  const m = Math.floor(n / 60);
+  const s = n - m * 60;
+  return `${m}:${s.toFixed(1).padStart(4, "0")}`;
+}
+
+function boardScenes() {
+  return (state && state.storyboard && state.storyboard.scenes) || [];
+}
+
+function closeSceneDetail() {
+  if (!openSceneId) return;
+  openSceneId = null;
+  if (segVideo) segVideo.pause();
+  cancelAnimationFrame(seg.raf);
+  shotDrawer.classList.remove("open");
+  shotBackdrop.classList.remove("open");
+  shotDrawer.setAttribute("aria-hidden", "true");
+  markActiveCard();
+}
+
+function stepScene(delta) {
+  const scenes = boardScenes();
+  const i = scenes.findIndex((c) => c.id === openSceneId);
+  const next = scenes[i + delta];
+  if (next) openSceneDetail(state, next);
+}
+
+function markActiveCard() {
+  document.querySelectorAll(".scene-card.active").forEach((n) => n.classList.remove("active"));
+  if (!openSceneId) return;
+  const node = document.querySelector(`.scene-card[data-scene="${CSS.escape(openSceneId)}"]`);
+  if (node) {
+    node.classList.add("active");
+    node.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+}
+
+function segTick() {
+  const v = segVideo;
+  if (!v) return;
+  if (seg.armed && v.currentTime >= seg.end - 1 / 60) {
+    v.pause();
+    v.currentTime = seg.end;
+    seg.armed = false;
+  }
+  updateSegUI();
+  if (!v.paused) seg.raf = requestAnimationFrame(segTick);
+}
+
+function updateSegUI() {
+  const v = segVideo;
+  const bar = shotDrawer.querySelector(".seg-bar");
+  if (!v || !bar) return;
+  const total = v.duration || (state.storyboard && state.storyboard.total_duration_seconds) || 1;
+  bar.querySelector(".seg-range").style.left = `${(seg.start / total) * 100}%`;
+  bar.querySelector(".seg-range").style.width = `${Math.max(0.3, ((seg.end - seg.start) / total) * 100)}%`;
+  bar.querySelector(".seg-head").style.left = `${(v.currentTime / total) * 100}%`;
+  const btn = shotDrawer.querySelector(".seg-play");
+  if (btn) btn.textContent = v.paused ? t("▶ Play shot") : t("❚❚ Pause");
+  const now = shotDrawer.querySelector(".seg-now");
+  if (now) now.textContent = `${fmtTC(v.currentTime)} / ${fmtTC(total)}`;
+}
+
+function toggleSegment() {
+  const v = segVideo;
+  if (!v) return;
+  if (!v.paused) { v.pause(); return; }
+  if (v.currentTime < seg.start - 0.05 || v.currentTime >= seg.end - 0.05) v.currentTime = seg.start;
+  seg.armed = true;
+  v.play();
+}
+
+function seekBar(e) {
+  const v = segVideo;
+  const bar = e.currentTarget;
+  if (!v || !v.duration) return;
+  const r = bar.getBoundingClientRect();
+  v.currentTime = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * v.duration;
+  // Scrubbing outside the shot means the user wants free playback there.
+  seg.armed = v.currentTime >= seg.start && v.currentTime < seg.end;
+  updateSegUI();
+}
+
+function ensureSegVideo(s) {
+  const src = s.storyboard && s.storyboard.source_video;
+  if (!src) return null;
+  const url = mediaURL(s.project_id, src);
+  if (!segVideo || segVideoSrc !== url) {
+    segVideo = el("video", { src: url, preload: "auto", playsinline: "" });
+    segVideoSrc = url;
+    segVideo.addEventListener("play", () => { cancelAnimationFrame(seg.raf); seg.raf = requestAnimationFrame(segTick); });
+    segVideo.addEventListener("pause", updateSegUI);
+    segVideo.addEventListener("seeked", updateSegUI);
+    segVideo.addEventListener("loadedmetadata", () => {
+      if (segVideo.currentTime < seg.start || segVideo.currentTime > seg.end) segVideo.currentTime = seg.start;
+      updateSegUI();
+    });
+    segVideo.addEventListener("click", toggleSegment);
+  }
+  return segVideo;
+}
+
+function renderPlayer(s, card) {
+  const v = ensureSegVideo(s);
+  if (!v) {
+    return el("div", { class: "seg-player missing" },
+      card.visual && card.visual.exists ? el("img", { src: mediaURL(s.project_id, card.visual.path), alt: "" }) : null,
+      el("div", { class: "seg-missing" },
+        t("Source video not found — put the reference video in the project's source/ folder.")));
+  }
+  v.pause();
+  seg.start = Number(card.start_seconds) || 0;
+  seg.end = Number(card.end_seconds) || seg.start;
+  seg.armed = false;
+  if (card.visual && card.visual.exists) v.poster = mediaURL(s.project_id, card.visual.path);
+  if (v.readyState >= 1) v.currentTime = seg.start;
+
+  const bar = el("div", { class: "seg-bar", onclick: seekBar, title: t("Click to seek") },
+    el("div", { class: "seg-range" }), el("div", { class: "seg-head" }));
+  return el("div", { class: "seg-player" },
+    el("div", { class: "seg-frame" }, v),
+    bar,
+    el("div", { class: "seg-ctrl" },
+      el("button", { type: "button", class: "seg-play", onclick: toggleSegment }, t("▶ Play shot")),
+      el("span", { class: "seg-span" }, `${fmtTC(seg.start)} – ${fmtTC(seg.end)}`),
+      el("span", { class: "seg-now" }, "")));
+}
+
+function openSceneDetail(s, card) {
+  openSceneId = card.id;
+  drawerProject = s.project_id;
+  const d = card.details || {};
+  const aspects = d.aspects || {};
+  const sl = d.shot_language || card.shot_language || {};
+  const scenes = boardScenes();
+  const idx = scenes.findIndex((c) => c.id === card.id);
+
+  const chips = [
+    sl.shot_size, sl.camera_movement,
+    sl.lens_mm ? `${sl.lens_mm}mm` : null,
+    sl.lighting_key, sl.depth_of_field ? `dof_${sl.depth_of_field}` : null, sl.color_temperature,
+  ].filter(Boolean);
+
+  const design = [
+    detailField("Shot intent", d.shot_intent || card.shot_intent),
+    detailField("Information role", d.information_role),
+    detailField("Framing", d.framing || card.framing),
+    detailField("Movement", d.movement || card.movement),
+    detailField("Overlays", d.overlay_notes),
+  ].filter(Boolean);
+
+  const aspectNodes = [...ASPECT_ROWS, ...ASPECT_EXTRA_ROWS]
+    .map(([key, label]) => detailField(label, aspects[key]))
+    .filter(Boolean);
+
+  const info = el("div", { class: "sd-info" },
+    card.description ? el("p", { class: "sd-desc" }, card.description) : null,
+    chips.length ? el("div", { class: "sd-chips" }, chips.map((c) => el("span", { class: "sd-chip" }, techLabel(c)))) : null,
+    card.narration ? el("div", { class: "sd-block" },
+      el("div", { class: "sd-heading" }, t("Dialogue")),
+      el("div", { class: "sd-dialogue" }, card.narration)) : null,
+    design.length ? el("div", { class: "sd-block" },
+      el("div", { class: "sd-heading" }, t("Shot design")),
+      el("div", { class: "sd-grid two" }, design)) : null,
+    card.required_assets.length ? el("div", { class: "sd-block" },
+      el("div", { class: "sd-heading" }, t("Required assets")),
+      el("div", { class: "sd-assets" }, card.required_assets.map((a) => el("div", { class: "sd-asset" },
+        el("span", { class: "sd-chip" }, techLabel(a.type)), el("span", {}, a.description || ""))))) : null,
+  );
+
+  shotDrawer.innerHTML = "";
+  shotDrawer.append(
+    el("div", { class: "sd-bar" },
+      el("span", { class: "sd-meta" }, `${sceneLabel(card.id)} · ${fmtTC(card.start_seconds)} – ${fmtTC(card.end_seconds)} · ${fmtDuration(card.duration_seconds) || ""}`),
+      el("h2", { class: "sd-title" }, humanizeRole(d.narrative_role) || humanizeRole(card.type)),
+      card.hero_moment ? el("span", { class: "sd-herochip" }, t("★ HERO")) : null,
+      el("span", { class: "sd-spacer" }),
+      el("span", { class: "sd-pos" }, `${idx + 1} / ${scenes.length}`),
+      el("button", { type: "button", class: "sd-nav", disabled: idx <= 0 ? "" : null, onclick: () => stepScene(-1) }, t("← Prev")),
+      el("button", { type: "button", class: "sd-nav", disabled: idx >= scenes.length - 1 ? "" : null, onclick: () => stepScene(1) }, t("Next →")),
+      el("button", { type: "button", class: "sd-nav close", onclick: closeSceneDetail }, t("ESC · CLOSE"))),
+    el("div", { class: "sd-top" }, renderPlayer(s, card), info),
+    aspectNodes.length
+      ? el("div", { class: "sd-block sd-aspects" },
+        el("div", { class: "sd-heading" }, t("Five-aspect breakdown")),
+        el("div", { class: "sd-grid three" }, aspectNodes))
+      : el("div", { class: "hint" }, t("This shot has no authored breakdown — add aspects to the brief or scene plan.")),
+  );
+  shotDrawer.classList.add("open");
+  shotBackdrop.classList.add("open");
+  shotDrawer.setAttribute("aria-hidden", "false");
+  shotDrawer.scrollTop = 0;
+  updateSegUI();
+  markActiveCard();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (!openSceneId) return;
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  if (e.key === "Escape") { closeSceneDetail(); e.stopImmediatePropagation(); }
+  else if (e.key === "ArrowRight") { stepScene(1); e.preventDefault(); }
+  else if (e.key === "ArrowLeft") { stepScene(-1); e.preventDefault(); }
+  else if (e.key === " ") { toggleSegment(); e.preventDefault(); }
+}, true);
+
 function sceneCard(s, card) {
   const dur = card.duration_seconds;
-  const width = Math.max(132, Math.min(300, 70 + (dur || 3) * 26));
-  const wrap = el("div", { class: "scene-card", style: `width:${width}px` });
+  const wrap = el("div", {
+    class: `scene-card${card.id === openSceneId ? " active" : ""}`,
+    "data-scene": card.id,
+    title: t("Open shot detail"),
+    onclick: () => openSceneDetail(s, card),
+  });
 
   const slate = el("div", { class: "sc-slate" },
     el("span", { class: "num" }, sceneLabel(card.id)),
@@ -702,7 +977,8 @@ function sceneCard(s, card) {
         el("video", { src: mediaURL(s.project_id, v.path), muted: "", preload: "metadata", playsinline: "" }),
         el("span", { class: "play" }, "▶"),
         badge ? el("span", { class: "badge" }, badge) : null);
-      thumb.onclick = () => {
+      thumb.onclick = (e) => {
+        e.stopPropagation();
         const vid = thumb.querySelector("video");
         if (vid.paused) vid.play(); else vid.pause();
       };
@@ -753,13 +1029,14 @@ function sceneCard(s, card) {
   }
   wrap.append(thumb);
 
+
   // shot language chips
   const sl = card.shot_language;
   if (sl) {
     wrap.append(el("div", { class: "shotchips", style: "display:flex;flex-wrap:wrap;gap:4px;padding:7px 2px 0" },
       [sl.shot_size, sl.camera_movement, sl.lens_mm ? `${sl.lens_mm}mm` : null, sl.lighting_key]
         .filter(Boolean)
-        .map((t) => el("span", { style: "font-family:var(--mono);font-size:calc(8.5px * var(--fs-scale));letter-spacing:.04em;color:#62626c;border:1px solid #212129;border-radius:3px;padding:1px 5px" }, String(t).replaceAll("_", " ")))));
+        .map((t) => el("span", { style: "font-family:var(--mono);font-size:calc(8.5px * var(--fs-scale));letter-spacing:.04em;color:#62626c;border:1px solid #212129;border-radius:3px;padding:1px 5px" }, techLabel(t)))));
   }
 
   // takes drawer
@@ -785,7 +1062,7 @@ function sceneCard(s, card) {
     wrap.append(el("div", {
       class: `narr${long ? " clip" : ""}`,
       title: t("Click to read the full narration"),
-      onclick: () => openNarrModal(card),
+      onclick: (e) => { e.stopPropagation(); openSceneDetail(s, card); },
     }, card.narration, long ? el("span", { class: "narr-more" }, "⤢") : null));
   } else if (card.shot_intent || card.description) {
     wrap.append(el("div", { class: "narr tc-note" }, (card.shot_intent || card.description || "").slice(0, 110)));
@@ -795,7 +1072,8 @@ function sceneCard(s, card) {
     const wave = el("div", { class: "wave", style: "cursor:pointer", title: t("Play narration") });
     waveBars(wave, card.id + narrAudio.path);
     wave.append(el("span", { class: "wv-time" }, narrAudio.duration_seconds ? fmtDuration(narrAudio.duration_seconds) : "♪"));
-    wave.onclick = () => {
+    wave.onclick = (e) => {
+      e.stopPropagation();
       player.src = mediaURL(s.project_id, narrAudio.path);
       player.play();
     };
@@ -807,12 +1085,12 @@ function sceneCard(s, card) {
 function renderStoryboard(s) {
   const board = s.storyboard;
   if (!board) return null;
-  const strip = el("div", { class: "filmstrip" });
+  const strip = el("div", { class: "filmstrip grid" });
   for (const card of board.scenes) strip.append(sceneCard(s, card));
-  return el("div", {},
+  return el("div", { class: "storyboard-wide" },
     el("div", { class: "section-title" }, t("Storyboard"),
       el("span", { class: "meta" },
-        t("{n} scenes{d} · card width ∝ duration", { n: board.scenes.length, d: board.total_duration_seconds ? ` · ${fmtDuration(board.total_duration_seconds)}` : "" }))),
+        t("{n} scenes{d} · click a shot for details", { n: board.scenes.length, d: board.total_duration_seconds ? ` · ${fmtDuration(board.total_duration_seconds)}` : "" }))),
     el("div", { class: "strip-outer" }, strip));
 }
 
@@ -1061,6 +1339,10 @@ function render() {
   document.title = `Backlot — ${s.title}`;
   document.body.classList.toggle("first", firstPaint);
   firstPaint = false;
+  // The storyboard grid scrolls on its own; a full rebuild must not jump it
+  // back to the first row while the user is browsing shots.
+  const prevGrid = document.querySelector(".filmstrip.grid");
+  const gridScroll = prevGrid ? prevGrid.scrollTop : 0;
   app.innerHTML = "";
   app.append(renderSlate(s));
   app.append(renderRail(s));
@@ -1091,16 +1373,20 @@ function render() {
   const renders = renderRenders(s);
 
   if (approvalReview || script || decisions || activity) {
-    for (const section of [storyboard, found, renders]) {
+    for (const section of [found, renders]) {
       if (section) main.append(section);
     }
     const hasAside = Boolean(decisions || activity);
     app.append(el("div", { class: `board${hasAside ? "" : " solo"}` }, main, hasAside ? aside : null));
+    // Full width: the grid needs the whole viewport, not the main column.
+    if (storyboard) app.append(storyboard);
   } else {
     for (const section of [storyboard, found, renders]) {
       if (section) app.append(section);
     }
   }
+  const grid = document.querySelector(".filmstrip.grid");
+  if (grid && gridScroll) grid.scrollTop = gridScroll;
 }
 
 // Defensive normalization (F-02): the server contract guarantees these

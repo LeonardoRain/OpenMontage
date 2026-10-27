@@ -95,6 +95,25 @@ class VideoAnalyzer(BaseTool):
                 "maximum": 50,
                 "description": "Maximum keyframes to extract",
             },
+            "language": {
+                "type": "string",
+                "description": "ISO 639-1 spoken language (e.g. 'zh'). Omit to auto-detect.",
+            },
+            "transcription_model": {
+                "type": "string",
+                "enum": ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+                "default": "medium",
+                "description": "faster-whisper model used when no platform captions exist",
+            },
+            "transcription_prompt": {
+                "type": "string",
+                "description": "Whisper initial prompt (character names, jargon). Chinese defaults to a simplified-script prompt.",
+            },
+            "refine_long_scenes": {
+                "type": "boolean",
+                "default": True,
+                "description": "Re-scan long scenes for low-contrast cuts (text/title cards) that global detectors miss",
+            },
             "output_dir": {
                 "type": "string",
                 "description": "Directory for analysis outputs (default: auto-generated)",
@@ -111,7 +130,7 @@ class VideoAnalyzer(BaseTool):
         cpu_cores=2, ram_mb=2048, vram_mb=0, disk_mb=3000,
         network_required=False,  # Only needed for URL sources
     )
-    idempotency_key_fields = ["source", "analysis_depth"]
+    idempotency_key_fields = ["source", "analysis_depth", "language", "transcription_model"]
     side_effects = [
         "downloads video to output_dir (if URL)",
         "writes keyframe images to output_dir/keyframes/",
@@ -323,22 +342,24 @@ class VideoAnalyzer(BaseTool):
             except Exception as e:
                 steps_failed.append(f"download_for_whisper: {e}")
 
-        # Fallback: Whisper transcription on audio
-        if transcript_data is None and audio_path:
+        # Fallback: Whisper transcription. Local files have no separate audio
+        # track, so the video itself is the transcription input.
+        whisper_input = audio_path or video_path
+        if transcript_data is None and whisper_input:
             try:
                 from tools.analysis.transcriber import Transcriber
                 transcriber = Transcriber()
-                # Let Whisper auto-detect language instead of assuming English
                 tr_inputs = {
-                    "input_path": audio_path,
-                    "model_size": "base",
+                    "input_path": whisper_input,
+                    "model_size": inputs.get("transcription_model", "medium"),
                     "output_dir": str(output_dir),
                 }
-                # Only set language if we know it from transcript attempt
-                detected_lang = brief.get("narration_transcript", {}).get("language")
-                if detected_lang and detected_lang != "en":
-                    tr_inputs["language"] = detected_lang
-                # else: let Whisper auto-detect
+                language = inputs.get("language")
+                if language:
+                    tr_inputs["language"] = language
+                prompt = inputs.get("transcription_prompt") or self._default_prompt(language)
+                if prompt:
+                    tr_inputs["initial_prompt"] = prompt
 
                 tr_result = transcriber.execute(tr_inputs)
                 if tr_result.success:
@@ -355,7 +376,7 @@ class VideoAnalyzer(BaseTool):
                             for s in segments
                         ],
                         "language": tr_result.data.get("language", "en"),
-                        "word_count": len(full_text.split()),
+                        "word_count": self._count_words(full_text),
                     }
                     transcript_data = brief["narration_transcript"]
                     steps_completed.append("transcript_whisper")
@@ -396,19 +417,35 @@ class VideoAnalyzer(BaseTool):
             except Exception as e:
                 steps_failed.append(f"scene_detect: {e}")
 
+        refined_cuts: list[float] = []
+        if video_path and scenes and inputs.get("refine_long_scenes", True):
+            try:
+                from tools.analysis import cut_refiner
+                scenes, refined_cuts = cut_refiner.refine_scenes(video_path, scenes)
+                if refined_cuts:
+                    (output_dir / "scenes.json").write_text(
+                        json.dumps({"scenes": scenes}, indent=2), encoding="utf-8"
+                    )
+                steps_completed.append("scene_refine")
+            except Exception as e:
+                steps_failed.append(f"scene_refine: {e}")
+
         # Build scene list for the brief
         if scenes:
             brief["structure_analysis"]["total_scenes"] = len(scenes)
             brief_scenes = []
             for scene in scenes:
-                brief_scenes.append({
+                entry = {
                     "scene_index": scene.get("index", scene.get("scene_index", 0)),
                     "start_time": scene.get("start_seconds", 0),
                     "end_time": scene.get("end_seconds", 0),
                     "description": "",  # Agent fills this via vision
                     "visual_type": "other",  # Agent classifies via vision
                     "energy_level": "medium",
-                })
+                }
+                if scene.get("refined"):
+                    entry["refined_cut"] = True
+                brief_scenes.append(entry)
             brief["structure_analysis"]["scenes"] = brief_scenes
 
             # Compute pacing profile
@@ -567,6 +604,7 @@ class VideoAnalyzer(BaseTool):
             "steps_failed": steps_failed,
             "keyframe_count": len(keyframes),
             "scene_count": len(scenes),
+            "refined_cuts": refined_cuts,
             "has_transcript": transcript_data is not None,
             "duration_seconds": round(time.time() - start, 2),
         }
@@ -586,6 +624,23 @@ class VideoAnalyzer(BaseTool):
         )
 
     # ─── Helpers ───
+
+    @staticmethod
+    def _default_prompt(language: str | None) -> str | None:
+        # Whisper drifts to traditional script on Mandarin without a nudge.
+        if language and language.lower().startswith("zh"):
+            return "以下是普通话的句子，使用简体中文，带标点。"
+        return None
+
+    @staticmethod
+    def _count_words(text: str) -> int:
+        """CJK characters count individually; other scripts count by whitespace."""
+        cjk = sum(1 for ch in text if "㐀" <= ch <= "鿿" or "぀" <= ch <= "ヿ")
+        latin = sum(
+            1 for tok in "".join(" " if "぀" <= ch <= "鿿" else ch for ch in text).split()
+            if any(c.isalnum() for c in tok)
+        )
+        return cjk + latin
 
     def _get_duration(self, video_path: Path) -> float:
         """Get video duration via ffprobe."""

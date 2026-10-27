@@ -33,9 +33,31 @@ Run VideoAnalyzer with `analysis_depth: "standard"`:
 video_analyzer.execute({
     "source": "<url or path>",
     "analysis_depth": "standard",
-    "max_keyframes": 20
+    "max_keyframes": 20,
+    "language": "zh",              # spoken language; omit to auto-detect
+    "transcription_model": "medium" # default; drop to "base" only for a quick look
 })
 ```
+
+Scene detection runs twice by design. `scene_detect` finds hard cuts; then
+`cut_refiner` re-samples long near-static scenes and splits them where a
+localized change spikes (title/quote cards swapping text on a fixed background
+— global detectors average those away). Boundaries that came from the second
+pass carry `refined_cut: true` in the brief, and every added timestamp is
+listed in `_analysis_meta.refined_cuts`. Check that list before trusting a
+scene count. Pass `"refine_long_scenes": false` to skip it.
+
+Transcription is a real quality gate, not a formality:
+
+- The default model is `medium`. `base` mangles Chinese names and drops characters.
+- Pass `language` explicitly when you know it — auto-detect on short clips is unreliable.
+- For Chinese it sends a simplified-script initial prompt by default, because
+  Whisper drifts to traditional script otherwise. Override it with
+  `transcription_prompt` to seed character names and jargon
+  (e.g. `"飘飘、茉莉、铲屎官"`), which is the cheapest accuracy win available.
+- `word_count` counts CJK characters individually, so
+  `style_profile.narration_style.words_per_minute` is meaningful for Chinese.
+  For CJK, treat 120–180 WPM as normal conversational pace.
 
 Read the resulting VideoAnalysisBrief. Before proceeding, present a summary to the
 user. This is NOT a raw dump. It's a conversational interpretation, and it MUST be
@@ -107,6 +129,38 @@ The analyst's report MUST break down the reference video into the **five aspects
 > **Mark any aspect explicitly as N/A** if it doesn't apply (e.g., "Subject: N/A — pure scenery shot," or "Scene overlays: N/A — no graphics"). **Silent omission is the most common analyst failure** and produces ambiguous downstream prompts.
 
 See `skills/creative/video-gen-prompting.md` for primitive definitions and the canonical vocabulary used at every aspect.
+
+### Step 1b: Build the storyboard artifacts
+
+Do not hand-write `scene_plan.json` / `script.json` per episode. Run the
+builder, then improve what it produces:
+
+```python
+analysis_to_storyboard.execute({
+    "project_dir": "projects/<project-id>",
+    "brief_path": ".../analysis/video_analyzer/video_analysis_brief.json",
+    "merge_seconds": 1.2,   # merge neighbouring cuts below this into one beat
+    "target_beats": 24      # hard ceiling; long timelines merge most aggressively
+})
+```
+
+It owns the mechanical parts that should be identical every run: merging hard
+cuts into narrative beats, `b##` / `s##` id assignment, `script_section_id`
+mapping, `text_card` vs `broll` classification from `motion_type`, and
+`snapshots/b##.jpg` extraction. It refuses to overwrite existing artifacts
+unless you pass `overwrite: true`.
+
+What it deliberately leaves empty — your job in the vision pass:
+
+- `description`, `framing`, `movement`, `narrative_role`, `hero_moment`,
+  `texture_keywords` — write these from the keyframes, not from timestamps.
+- `speaker_directions` and `delivery_cues` in the script — one entry per
+  character, with the voice/pacing reasoning spelled out.
+- `scene_plan.style_playbook` — set from `taste-direction` or the closest playbook.
+
+Beats that straddle a cut cannot be merged back, so if a beat boundary looks
+wrong it is almost always a scene-detection problem upstream — check
+`refined_cuts` and `pacing_profile` before editing the plan by hand.
 
 ### Step 2: Capability Audit
 
